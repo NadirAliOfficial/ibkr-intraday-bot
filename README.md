@@ -224,3 +224,4 @@ ibkr-intraday-bot/
 | Position sizing | Account value × risk % ÷ (entry − stop) |
 <!-- updated: 2026-05-29 -->
 
+
