@@ -223,3 +223,4 @@ ibkr-intraday-bot/
 | Stop direction | Only moves up, never down |
 | Position sizing | Account value × risk % ÷ (entry − stop) |
 <!-- updated: 2026-05-29 -->
+
