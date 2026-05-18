@@ -86,7 +86,7 @@ class TickerManager:
         self.state = "watching"
         log.info(f"[{self.symbol}] Monitoring — waiting for 9:30 candle")
 
-        self.bars_1m = self.ib.reqHistoricalData(
+        self.bars_1m = await self.ib.reqHistoricalDataAsync(
             self.contract,
             endDateTime="",
             durationStr="1 D",
@@ -201,7 +201,7 @@ class TickerManager:
         self.stop_trade = self.ib.placeOrder(self.contract, stop_order)
         self.stop_trade.filledEvent += lambda t: self._on_stop_filled()
 
-        self.bars_5m = self.ib.reqHistoricalData(
+        self.bars_5m = await self.ib.reqHistoricalDataAsync(
             self.contract,
             endDateTime="",
             durationStr="1 D",
