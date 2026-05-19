@@ -98,10 +98,16 @@ class TickerManager:
         self.state = "watching"
 
         now = datetime.now(ET)
-        open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        if self.cfg.get("test_mode"):
+            # Test mode: trigger candle tracking 2 minutes from now
+            open_time = now + timedelta(minutes=2)
+            log.info(f"[{self.symbol}] TEST MODE — candle tracking starts at {open_time.strftime('%H:%M:%S')} ET")
+        else:
+            open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+
         deadline = open_time + timedelta(minutes=self.cfg["cancel_after_minutes"])
 
-        if now > deadline:
+        if not self.cfg.get("test_mode") and now > deadline:
             log.info(f"[{self.symbol}] Past cancel window — skipping today")
             self.state = "done"
             return

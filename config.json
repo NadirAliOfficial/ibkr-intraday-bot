@@ -4,5 +4,6 @@
     "client_id": 1,
     "risk_percent": 0.5,
     "cancel_after_minutes": 15,
-    "account": ""
+    "account": "",
+    "test_mode": true
 }
