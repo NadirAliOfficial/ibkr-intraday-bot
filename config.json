@@ -5,5 +5,5 @@
     "risk_percent": 0.5,
     "cancel_after_minutes": 15,
     "account": "",
-    "test_mode": true
+    "test_mode": false
 }
