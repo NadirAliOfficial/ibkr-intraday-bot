@@ -108,24 +108,30 @@ class TickerManager:
         if self.first_candle_handled or self.state != "watching":
             return
 
-        try:
-            bars = await self.ib.reqHistoricalDataAsync(
-                self.contract,
-                endDateTime="",
-                durationStr="120 S",
-                barSizeSetting="1 min",
-                whatToShow="TRADES",
-                useRTH=True,
-                formatDate=1,
-                keepUpToDate=False,
-            )
-        except Exception as e:
-            log.error(f"[{self.symbol}] Historical data request failed: {e}")
-            self.state = "done"
-            return
+        bars = []
+        for data_type in ("TRADES", "MIDPOINT"):
+            try:
+                bars = await self.ib.reqHistoricalDataAsync(
+                    self.contract,
+                    endDateTime="",
+                    durationStr="120 S",
+                    barSizeSetting="1 min",
+                    whatToShow=data_type,
+                    useRTH=True,
+                    formatDate=1,
+                    keepUpToDate=False,
+                )
+            except Exception as e:
+                log.warning(f"[{self.symbol}] {data_type} request error: {e}")
+                bars = []
+            if bars:
+                break
 
         if not bars:
-            log.warning(f"[{self.symbol}] No candle data returned — no trade placed")
+            log.error(
+                f"[{self.symbol}] No market data available — check your IBKR market data "
+                "subscription at Account Management > Market Data Subscriptions"
+            )
             self.state = "done"
             return
 
@@ -225,16 +231,27 @@ class TickerManager:
         self.stop_trade = self.ib.placeOrder(self.contract, stop_order)
         self.stop_trade.filledEvent += lambda t: self._on_stop_filled()
 
-        self.bars_5m = await self.ib.reqHistoricalDataAsync(
-            self.contract,
-            endDateTime="",
-            durationStr="1 D",
-            barSizeSetting="5 mins",
-            whatToShow="TRADES",
-            useRTH=True,
-            formatDate=1,
-            keepUpToDate=True,
-        )
+        for data_type in ("TRADES", "MIDPOINT"):
+            try:
+                self.bars_5m = await self.ib.reqHistoricalDataAsync(
+                    self.contract,
+                    endDateTime="",
+                    durationStr="1 D",
+                    barSizeSetting="5 mins",
+                    whatToShow=data_type,
+                    useRTH=True,
+                    formatDate=1,
+                    keepUpToDate=True,
+                )
+            except Exception:
+                self.bars_5m = None
+            if self.bars_5m is not None:
+                break
+
+        if self.bars_5m is None:
+            log.error(f"[{self.symbol}] Could not subscribe to 5-min bars — trailing stop inactive")
+            return
+
         self.bars_5m.updateEvent += self._on_5m_update
         log.info(f"[{self.symbol}] Trailing stop active | watching 5-min bars")
 
