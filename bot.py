@@ -70,7 +70,6 @@ class TickerManager:
         self.current_stop: float = None
         self.shares: int = 0
 
-        self.bars_1m = None
         self.bars_5m = None
         self.cancel_handle = None
         self.first_candle_handled = False
@@ -84,19 +83,18 @@ class TickerManager:
             return
 
         self.state = "watching"
-        log.info(f"[{self.symbol}] Monitoring — waiting for 9:30 candle")
 
-        self.bars_1m = await self.ib.reqHistoricalDataAsync(
-            self.contract,
-            endDateTime="",
-            durationStr="1 D",
-            barSizeSetting="1 min",
-            whatToShow="TRADES",
-            useRTH=True,
-            formatDate=1,
-            keepUpToDate=True,
+        # Schedule the candle pull for 9:31:10 ET — after the first 1-min bar has closed.
+        # Requesting at open causes "HMDS query returned no data" because IBKR has no RTH
+        # data yet. Waiting until 9:31:10 guarantees the 9:30 bar exists.
+        now = datetime.now(ET)
+        target = now.replace(hour=9, minute=31, second=10, microsecond=0)
+        delay = max(0.0, (target - now).total_seconds())
+        log.info(f"[{self.symbol}] Candle check scheduled in {delay:.0f}s")
+        asyncio.get_event_loop().call_later(
+            delay,
+            lambda: asyncio.ensure_future(self._fetch_opening_candle()),
         )
-        self.bars_1m.updateEvent += self._on_1m_update
 
     def _parse_bar_dt(self, bar) -> datetime:
         dt = bar.date
@@ -106,21 +104,46 @@ class TickerManager:
             dt = dt.replace(tzinfo=ET)
         return dt
 
-    def _on_1m_update(self, bars, has_new_bar: bool):
-        if not has_new_bar or self.first_candle_handled or self.state != "watching":
-            return
-        if len(bars) < 2:
+    async def _fetch_opening_candle(self):
+        if self.first_candle_handled or self.state != "watching":
             return
 
-        # bars[-1] = new bar just opened, bars[-2] = bar that just completed
-        completed = bars[-2]
-        bar_dt = self._parse_bar_dt(completed)
+        try:
+            bars = await self.ib.reqHistoricalDataAsync(
+                self.contract,
+                endDateTime="",
+                durationStr="120 S",
+                barSizeSetting="1 min",
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+                keepUpToDate=False,
+            )
+        except Exception as e:
+            log.error(f"[{self.symbol}] Historical data request failed: {e}")
+            self.state = "done"
+            return
 
-        # Only act on the 9:30 opening candle
-        if bar_dt.hour != 9 or bar_dt.minute != 30:
+        if not bars:
+            log.warning(f"[{self.symbol}] No candle data returned — no trade placed")
+            self.state = "done"
+            return
+
+        # Find the 9:30 candle
+        opening_candle = None
+        for bar in bars:
+            bar_dt = self._parse_bar_dt(bar)
+            if bar_dt.hour == 9 and bar_dt.minute == 30:
+                opening_candle = bar
+                break
+
+        if opening_candle is None:
+            log.warning(f"[{self.symbol}] 9:30 candle not found in returned data — no trade placed")
+            self.state = "done"
             return
 
         now = datetime.now(ET)
+        bar_dt = self._parse_bar_dt(opening_candle)
         deadline = bar_dt + timedelta(minutes=self.cfg["cancel_after_minutes"])
         if now > deadline:
             log.info(f"[{self.symbol}] Past cancellation window — skipping today")
@@ -128,7 +151,10 @@ class TickerManager:
             return
 
         self.first_candle_handled = True
-        asyncio.ensure_future(self._place_entry(completed))
+        log.info(
+            f"[{self.symbol}] 9:30 candle | H={opening_candle.high} L={opening_candle.low}"
+        )
+        await self._place_entry(opening_candle)
 
     async def _place_entry(self, candle):
         entry_price = round(candle.high, 2)
@@ -180,7 +206,6 @@ class TickerManager:
         )
         self.ib.cancelOrder(self.entry_trade.order)
         self.state = "done"
-        self._stop_1m_feed()
 
     def _on_entry_filled(self, trade):
         if self.cancel_handle:
@@ -194,7 +219,6 @@ class TickerManager:
 
     async def _activate_stop_and_trail(self):
         self.state = "in_position"
-        self._stop_1m_feed()
 
         stop_order = StopOrder("SELL", self.shares, self.current_stop)
         stop_order.tif = "DAY"
@@ -236,18 +260,12 @@ class TickerManager:
         self.state = "done"
         self._stop_5m_feed()
 
-    def _stop_1m_feed(self):
-        if self.bars_1m:
-            self.ib.cancelHistoricalData(self.bars_1m)
-            self.bars_1m = None
-
     def _stop_5m_feed(self):
         if self.bars_5m:
             self.ib.cancelHistoricalData(self.bars_5m)
             self.bars_5m = None
 
     def cleanup(self):
-        self._stop_1m_feed()
         self._stop_5m_feed()
         if self.cancel_handle:
             self.cancel_handle.cancel()
