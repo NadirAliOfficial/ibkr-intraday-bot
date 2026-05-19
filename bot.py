@@ -27,7 +27,7 @@ def setup_logging():
 def load_config():
     path = Path("config.json")
     if not path.exists():
-        raise FileNotFoundError("config.json not found — check the README")
+        raise FileNotFoundError("config.json not found")
     with open(path) as f:
         return json.load(f)
 
@@ -35,10 +35,10 @@ def load_config():
 def load_tickers():
     path = Path("tickers.txt")
     if not path.exists():
-        raise FileNotFoundError("tickers.txt not found — add your tickers before running")
+        raise FileNotFoundError("tickers.txt not found")
     tickers = [line.strip().upper() for line in path.read_text().splitlines() if line.strip()]
     if not tickers:
-        raise ValueError("tickers.txt is empty — add at least one ticker")
+        raise ValueError("tickers.txt is empty")
     if len(tickers) > 15:
         log.warning(f"Trimming ticker list from {len(tickers)} to 15")
         tickers = tickers[:15]
@@ -52,9 +52,13 @@ def get_account_value(ib: IB, account: str = "") -> float:
             return float(v.value)
     for v in vals:
         if v.tag == "NetLiquidation":
-            log.warning(f"USD NetLiquidation not found — using {v.currency} value for sizing")
+            log.warning(f"Using {v.currency} NetLiquidation for position sizing")
             return float(v.value)
-    raise RuntimeError("Cannot read account value from IBKR. Check your connection and account.")
+    raise RuntimeError("Cannot read account value from IBKR")
+
+
+def valid_price(p) -> bool:
+    return p is not None and not math.isnan(p) and p > 0
 
 
 class TickerManager:
@@ -70,106 +74,104 @@ class TickerManager:
         self.current_stop: float = None
         self.shares: int = 0
 
-        self.bars_5m = None
+        self.ticker_obj = None
+
+        # 9:30 candle tracking
+        self.c_open: float = None
+        self.c_high: float = None
+        self.c_low: float = None
+
+        # 5-min trailing window
+        self.trail_window_low: float = float("inf")
+        self.trail_window_start: datetime = None
+
         self.cancel_handle = None
-        self.first_candle_handled = False
 
     async def start(self):
         try:
             await self.ib.qualifyContractsAsync(self.contract)
         except Exception as e:
-            log.error(f"[{self.symbol}] Failed to qualify contract: {e}")
+            log.error(f"[{self.symbol}] Contract qualify failed: {e}")
             self.state = "done"
             return
 
         self.state = "watching"
 
-        # Schedule the candle pull for 9:31:10 ET — after the first 1-min bar has closed.
-        # Requesting at open causes "HMDS query returned no data" because IBKR has no RTH
-        # data yet. Waiting until 9:31:10 guarantees the 9:30 bar exists.
         now = datetime.now(ET)
-        target = now.replace(hour=9, minute=31, second=10, microsecond=0)
-        delay = max(0.0, (target - now).total_seconds())
-        log.info(f"[{self.symbol}] Candle check scheduled in {delay:.0f}s")
+        open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        deadline = open_time + timedelta(minutes=self.cfg["cancel_after_minutes"])
+
+        if now > deadline:
+            log.info(f"[{self.symbol}] Past cancel window — skipping today")
+            self.state = "done"
+            return
+
+        delay = max(0.0, (open_time - now).total_seconds())
+        log.info(f"[{self.symbol}] Candle tracking starts in {delay:.0f}s")
+
         asyncio.get_event_loop().call_later(
             delay,
-            lambda: asyncio.ensure_future(self._fetch_opening_candle()),
+            lambda: asyncio.ensure_future(self._begin_candle_tracking()),
         )
 
-    def _parse_bar_dt(self, bar) -> datetime:
-        dt = bar.date
-        if isinstance(dt, str):
-            dt = datetime.strptime(dt, "%Y%m%d %H:%M:%S")
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ET)
-        return dt
-
-    async def _fetch_opening_candle(self):
-        if self.first_candle_handled or self.state != "watching":
+    async def _begin_candle_tracking(self):
+        if self.state != "watching":
             return
 
-        bars = []
-        for data_type in ("TRADES", "MIDPOINT"):
-            try:
-                bars = await self.ib.reqHistoricalDataAsync(
-                    self.contract,
-                    endDateTime="",
-                    durationStr="120 S",
-                    barSizeSetting="1 min",
-                    whatToShow=data_type,
-                    useRTH=True,
-                    formatDate=1,
-                    keepUpToDate=False,
-                )
-            except Exception as e:
-                log.warning(f"[{self.symbol}] {data_type} request error: {e}")
-                bars = []
-            if bars:
-                break
+        self.c_open = None
+        self.c_high = -float("inf")
+        self.c_low = float("inf")
 
-        if not bars:
+        self.ticker_obj = self.ib.reqMktData(self.contract, "", False, False)
+        self.ticker_obj.updateEvent += self._on_tick_candle
+        log.info(f"[{self.symbol}] Tracking 9:30 candle via live ticks")
+
+        # 9:30 candle closes at 9:31 — wait 65 seconds to be safe
+        asyncio.get_event_loop().call_later(
+            65,
+            lambda: asyncio.ensure_future(self._finalize_opening_candle()),
+        )
+
+    def _on_tick_candle(self, ticker):
+        price = ticker.last
+        if not valid_price(price):
+            price = ticker.close
+        if not valid_price(price):
+            return
+        if self.c_open is None:
+            self.c_open = price
+        if price > self.c_high:
+            self.c_high = price
+        if price < self.c_low:
+            self.c_low = price
+
+    async def _finalize_opening_candle(self):
+        if self.state != "watching":
+            return
+
+        # Unregister candle tick handler
+        if self.ticker_obj:
+            self.ticker_obj.updateEvent -= self._on_tick_candle
+
+        if self.c_open is None or self.c_high == -float("inf"):
             log.error(
-                f"[{self.symbol}] No market data available — check your IBKR market data "
-                "subscription at Account Management > Market Data Subscriptions"
+                f"[{self.symbol}] No tick data received for 9:30 candle. "
+                "Make sure your IBKR account has a US market data subscription."
             )
+            self._cancel_mktdata()
             self.state = "done"
             return
 
-        # Find the 9:30 candle
-        opening_candle = None
-        for bar in bars:
-            bar_dt = self._parse_bar_dt(bar)
-            if bar_dt.hour == 9 and bar_dt.minute == 30:
-                opening_candle = bar
-                break
+        candle_high = round(self.c_high, 2)
+        candle_low = round(self.c_low, 2)
+        log.info(f"[{self.symbol}] 9:30 candle | H={candle_high} L={candle_low}")
 
-        if opening_candle is None:
-            log.warning(f"[{self.symbol}] 9:30 candle not found in returned data — no trade placed")
-            self.state = "done"
-            return
+        await self._place_entry(candle_high, candle_low)
 
-        now = datetime.now(ET)
-        bar_dt = self._parse_bar_dt(opening_candle)
-        deadline = bar_dt + timedelta(minutes=self.cfg["cancel_after_minutes"])
-        if now > deadline:
-            log.info(f"[{self.symbol}] Past cancellation window — skipping today")
-            self.state = "done"
-            return
-
-        self.first_candle_handled = True
-        log.info(
-            f"[{self.symbol}] 9:30 candle | H={opening_candle.high} L={opening_candle.low}"
-        )
-        await self._place_entry(opening_candle)
-
-    async def _place_entry(self, candle):
-        entry_price = round(candle.high, 2)
-        stop_price = round(candle.low, 2)
-
+    async def _place_entry(self, entry_price: float, stop_price: float):
         if entry_price <= stop_price:
-            log.warning(
-                f"[{self.symbol}] Candle high ({entry_price}) <= low ({stop_price}) — skipping"
-            )
+            log.warning(f"[{self.symbol}] High ({entry_price}) <= Low ({stop_price}) — skipping")
+            self._cancel_mktdata()
             self.state = "done"
             return
 
@@ -177,6 +179,7 @@ class TickerManager:
             account_value = get_account_value(self.ib, self.cfg.get("account", ""))
         except RuntimeError as e:
             log.error(f"[{self.symbol}] {e}")
+            self._cancel_mktdata()
             self.state = "done"
             return
 
@@ -207,20 +210,16 @@ class TickerManager:
     async def _cancel_unfilled(self):
         if self.state != "order_placed":
             return
-        log.info(
-            f"[{self.symbol}] {self.cfg['cancel_after_minutes']} min elapsed — cancelling unfilled buy"
-        )
+        log.info(f"[{self.symbol}] {self.cfg['cancel_after_minutes']} min elapsed — cancelling unfilled buy")
         self.ib.cancelOrder(self.entry_trade.order)
+        self._cancel_mktdata()
         self.state = "done"
 
     def _on_entry_filled(self, trade):
         if self.cancel_handle:
             self.cancel_handle.cancel()
         fill_px = trade.orderStatus.avgFillPrice
-        log.info(
-            f"[{self.symbol}] BUY FILLED @ {fill_px} | "
-            f"placing stop-loss @ {self.current_stop}"
-        )
+        log.info(f"[{self.symbol}] BUY FILLED @ {fill_px} | placing stop @ {self.current_stop}")
         asyncio.ensure_future(self._activate_stop_and_trail())
 
     async def _activate_stop_and_trail(self):
@@ -231,59 +230,68 @@ class TickerManager:
         self.stop_trade = self.ib.placeOrder(self.contract, stop_order)
         self.stop_trade.filledEvent += lambda t: self._on_stop_filled()
 
-        for data_type in ("TRADES", "MIDPOINT"):
-            try:
-                self.bars_5m = await self.ib.reqHistoricalDataAsync(
-                    self.contract,
-                    endDateTime="",
-                    durationStr="1 D",
-                    barSizeSetting="5 mins",
-                    whatToShow=data_type,
-                    useRTH=True,
-                    formatDate=1,
-                    keepUpToDate=True,
-                )
-            except Exception:
-                self.bars_5m = None
-            if self.bars_5m is not None:
-                break
+        # Reuse existing ticker subscription for trailing stop tracking
+        self.trail_window_low = float("inf")
+        self.trail_window_start = None
 
-        if self.bars_5m is None:
-            log.error(f"[{self.symbol}] Could not subscribe to 5-min bars — trailing stop inactive")
+        if self.ticker_obj:
+            self.ticker_obj.updateEvent += self._on_tick_trail
+        else:
+            self.ticker_obj = self.ib.reqMktData(self.contract, "", False, False)
+            self.ticker_obj.updateEvent += self._on_tick_trail
+
+        log.info(f"[{self.symbol}] Trailing stop active | tracking 5-min candle lows")
+
+    def _on_tick_trail(self, ticker):
+        if self.state != "in_position":
             return
 
-        self.bars_5m.updateEvent += self._on_5m_update
-        log.info(f"[{self.symbol}] Trailing stop active | watching 5-min bars")
-
-    def _on_5m_update(self, bars, has_new_bar: bool):
-        if not has_new_bar or self.state != "in_position":
-            return
-        if len(bars) < 2:
+        price = ticker.last
+        if not valid_price(price):
+            price = ticker.close
+        if not valid_price(price):
             return
 
-        completed = bars[-2]
-        candidate = round(completed.low, 2)
+        now = datetime.now(ET)
+        # Align to 5-minute candle boundary
+        candle_minute = (now.minute // 5) * 5
+        candle_start = now.replace(minute=candle_minute, second=0, microsecond=0)
 
-        if candidate > self.current_stop:
-            log.info(
-                f"[{self.symbol}] TRAIL STOP {self.current_stop} -> {candidate}"
-            )
-            self.current_stop = candidate
-            self.stop_trade.order.auxPrice = candidate
-            self.ib.placeOrder(self.contract, self.stop_trade.order)
+        if self.trail_window_start is None:
+            self.trail_window_start = candle_start
+            self.trail_window_low = price
+            return
+
+        if candle_start > self.trail_window_start:
+            # Previous 5-min candle just completed
+            completed_low = round(self.trail_window_low, 2)
+            if completed_low > self.current_stop:
+                log.info(f"[{self.symbol}] TRAIL STOP {self.current_stop} -> {completed_low}")
+                self.current_stop = completed_low
+                self.stop_trade.order.auxPrice = completed_low
+                self.ib.placeOrder(self.contract, self.stop_trade.order)
+            # Start new window
+            self.trail_window_start = candle_start
+            self.trail_window_low = price
+        else:
+            if price < self.trail_window_low:
+                self.trail_window_low = price
 
     def _on_stop_filled(self):
         log.info(f"[{self.symbol}] STOP FILLED — position closed")
+        self._cancel_mktdata()
         self.state = "done"
-        self._stop_5m_feed()
 
-    def _stop_5m_feed(self):
-        if self.bars_5m:
-            self.ib.cancelHistoricalData(self.bars_5m)
-            self.bars_5m = None
+    def _cancel_mktdata(self):
+        if self.ticker_obj:
+            try:
+                self.ib.cancelMktData(self.contract)
+            except Exception:
+                pass
+            self.ticker_obj = None
 
     def cleanup(self):
-        self._stop_5m_feed()
+        self._cancel_mktdata()
         if self.cancel_handle:
             self.cancel_handle.cancel()
 
@@ -310,7 +318,7 @@ async def main():
         )
     except Exception as e:
         log.error(f"Connection failed: {e}")
-        log.error("Make sure TWS or IB Gateway is running with API enabled on the correct port.")
+        log.error("Make sure TWS or IB Gateway is running with API enabled.")
         return
 
     log.info("Connected to IBKR")
@@ -319,17 +327,16 @@ async def main():
 
     try:
         await asyncio.gather(*[m.start() for m in managers])
-        log.info("All tickers active. Waiting for market open. Press Ctrl+C to stop.")
+        log.info("All tickers active. Press Ctrl+C to stop.")
 
         while True:
             await asyncio.sleep(30)
             now = datetime.now(ET)
             if now.hour >= 16:
-                log.info("4:00 PM ET reached — shutting down")
+                log.info("4:00 PM ET — shutting down")
                 break
-            active = [m.symbol for m in managers if m.state not in ("done",)]
-            if not active:
-                log.info("All positions resolved — shutting down")
+            if all(m.state == "done" for m in managers):
+                log.info("All tickers resolved — shutting down")
                 break
 
     except (KeyboardInterrupt, asyncio.CancelledError):
