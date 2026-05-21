@@ -81,7 +81,8 @@ class TickerManager:
         self.c_high: float = None
         self.c_low: float = None
 
-        # 5-min trailing window
+        # trailing stop window
+        self.trail_tf: int = cfg.get("trailing_timeframe_minutes", 5)
         self.trail_window_low: float = float("inf")
         self.trail_window_start: datetime = None
 
@@ -246,7 +247,7 @@ class TickerManager:
             self.ticker_obj = self.ib.reqMktData(self.contract, "", False, False)
             self.ticker_obj.updateEvent += self._on_tick_trail
 
-        log.info(f"[{self.symbol}] Trailing stop active | tracking 5-min candle lows")
+        log.info(f"[{self.symbol}] Trailing stop active | tracking {self.trail_tf}-min candle lows")
 
     def _on_tick_trail(self, ticker):
         if self.state != "in_position":
@@ -259,8 +260,7 @@ class TickerManager:
             return
 
         now = datetime.now(ET)
-        # Align to 5-minute candle boundary
-        candle_minute = (now.minute // 5) * 5
+        candle_minute = (now.minute // self.trail_tf) * self.trail_tf
         candle_start = now.replace(minute=candle_minute, second=0, microsecond=0)
 
         if self.trail_window_start is None:
@@ -312,6 +312,7 @@ async def main():
     log.info(f"Tickers       : {tickers}")
     log.info(f"Risk per trade: {cfg['risk_percent']}%")
     log.info(f"Cancel after  : {cfg['cancel_after_minutes']} minutes")
+    log.info(f"Trail TF      : {cfg.get('trailing_timeframe_minutes', 5)} minutes")
     log.info(f"Port          : {cfg['port']}")
     log.info("=" * 60)
 

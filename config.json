@@ -4,6 +4,7 @@
     "client_id": 1,
     "risk_percent": 0.5,
     "cancel_after_minutes": 15,
+    "trailing_timeframe_minutes": 5,
     "account": "",
     "test_mode": false
 }
