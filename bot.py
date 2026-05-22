@@ -142,8 +142,6 @@ class TickerManager:
     def _on_tick_candle(self, ticker):
         price = ticker.last
         if not valid_price(price):
-            price = ticker.close
-        if not valid_price(price):
             return
         if self.c_open is None:
             self.c_open = price
@@ -254,8 +252,6 @@ class TickerManager:
             return
 
         price = ticker.last
-        if not valid_price(price):
-            price = ticker.close
         if not valid_price(price):
             return
 
