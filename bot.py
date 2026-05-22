@@ -133,9 +133,9 @@ class TickerManager:
         self.ticker_obj.updateEvent += self._on_tick_candle
         log.info(f"[{self.symbol}] Tracking 9:30 candle via live ticks")
 
-        # 9:30 candle closes at 9:31 — wait 65 seconds to be safe
+        # 9:30 candle closes at 9:31 — wait 61 seconds (1s buffer after close)
         asyncio.get_event_loop().call_later(
-            65,
+            61,
             lambda: asyncio.ensure_future(self._finalize_opening_candle()),
         )
 
