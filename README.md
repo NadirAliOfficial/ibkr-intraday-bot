@@ -222,4 +222,4 @@ ibkr-intraday-bot/
 | Trailing stop | Trails below completed 5-minute candle lows |
 | Stop direction | Only moves up, never down |
 | Position sizing | Account value × risk % ÷ (entry − stop) |
-<!-- updated: 2025-11-29 -->
+<!-- updated: 2026-05-29 -->
