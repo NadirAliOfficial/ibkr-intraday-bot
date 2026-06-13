@@ -78,8 +78,8 @@ class TickerManager:
 
         # 9:30 candle tracking
         self.c_open: float = None
-        self.c_high: float = None
-        self.c_low: float = None
+        self.c_high: float = -float("inf")
+        self.c_low: float = float("inf")
 
         # trailing stop window
         self.trail_tf: int = cfg.get("trailing_timeframe_minutes", 5)
