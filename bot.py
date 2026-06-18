@@ -36,7 +36,7 @@ def load_tickers():
     path = Path("tickers.txt")
     if not path.exists():
         raise FileNotFoundError("tickers.txt not found")
-    tickers = [line.strip().upper() for line in path.read_text().splitlines() if line.strip()]
+    tickers = [line.strip().upper() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     if not tickers:
         raise ValueError("tickers.txt is empty")
     if len(tickers) > 15:
