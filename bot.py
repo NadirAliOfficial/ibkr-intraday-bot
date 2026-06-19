@@ -28,7 +28,7 @@ def load_config():
     path = Path("config.json")
     if not path.exists():
         raise FileNotFoundError("config.json not found")
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
